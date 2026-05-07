@@ -1,0 +1,868 @@
+---
+title: "pubmed_metadata_retrieval"
+output: html_document
+date: "2026-05-06"
+---
+
+```{r setup}
+#library(XML) # process the NCBI query xml results
+library(reutils) # R version of NCBI EUtilities for retrieving abstracts
+library(rgnparser) # parse scientific names from abstracts
+library(xml2) # process the NCBI query xml results
+library(dplyr) # basic data manipulation
+library(tidyr) # basic data manipulation
+library(data.table) # basic data manipulation
+library(ggplot2) # data visualization
+library(ggrepel) # data visualization
+library(cowplot) # assemble multipanel figures
+library(rphylopic) # access the PhyloPic image set via R
+library(rgbif) # access the GBIF dataset in R
+library(CoordinateCleaner) # cleaning coordinates from GBIF searches
+library(maps) # for producing maps
+library(sf) # for producing maps
+library(countrycode) # for producing maps
+library(rnaturalearth) # for producing maps
+library(rnaturalearthdata) # for producing maps
+
+#set working directory
+knitr::opts_knit$set(root.dir = "~/Hybridization_in_animal_evolution_review/")
+sessionInfo()
+getwd()
+
+# set formatting for numbers
+options(scipen = 999)
+```
+
+```{r read-in-abstracts}
+#read in the abstracts you previously retrieved with the Hunnicutt_Schumer_2026_Retrieve_Hybridization_PubMed_Abstracts.md script; confirm number of entries is 12282 (accurate as of 2Feb26)
+pmids <- read.table("data/hybridization_MESH_terms_pubmed_search_2Feb26.txt")
+num_pmids <- dim(pmids)[1]
+
+# efetch limits the number of queries that can be submitted at one time so the PubMed IDs (PMIDs) need to be split into batches; have chosen a batch size of 100 here
+batch_size <- 100
+num_batches <- ceiling(num_pmids / batch_size)
+
+# create a data frame of the start and end abstract for each batch
+batches <- NULL
+for (batch in 1:num_batches){
+  if(batch < num_batches){
+    batch_bounds <- c(((batch-1)*batch_size)+1, batch*batch_size)
+  } else {
+    batch_bounds <- c(((batch-1)*batch_size)+1, num_pmids)
+  }
+  batches <- rbind(batches, t(data.frame(batch_bounds)))
+}
+batches <- unname(batches)
+
+# # a function to retrieve PMIDs and associated metadata for each batch; uncomment if you have never run this before
+# batch_pmid_retrieval <- function(which_batch){
+#   
+#   #run efetch on the batch, read in the xml output to R
+#   pmid_efetch <- efetch(which_batch, db = "pubmed", retmode = "xml", outfile = "data/tmp_ret.xml")
+#   pmid_xml <- read_xml("data/tmp_ret.xml")
+#   article_nodes <- xml_find_all(pmid_xml, "//PubmedArticle")
+# 
+#   # a function that parses metadata for a given article in the batch
+#   parse_individual_article <- function(example_article) {
+#     pmid <- xml_text(xml_find_first(example_article, ".//PMID"))
+#     title <- xml_text(xml_find_first(example_article, ".//ArticleTitle"))
+#     journal <- xml_text(xml_find_first(example_article, ".//Journal/Title"))
+#     pub_year <- xml_text(xml_find_first(example_article, ".//PubDate/Year"))
+#     pub_month <- xml_text(xml_find_first(example_article, ".//PubDate/Month"))
+#     pub_day <- xml_text(xml_find_first(example_article, ".//PubDate/Day"))
+#     pub_date <- paste(pub_day, pub_month, pub_year, sep = "-")
+#     abstract <- xml_text(xml_find_first(example_article, ".//Abstract/AbstractText"))
+# 
+#     data.frame(
+#       pmid = pmid,
+#       title = title,
+#       journal = journal,
+#       pub_date = pub_date,
+#       abstract = abstract
+#     )
+#   }
+# 
+#   # rbind all individual article metadata into one dataframe 
+#   xml_df <- do.call(rbind,lapply(article_nodes, parse_individual_article))
+#   
+#   # for some reason, each PMID has a duplicate in this data set so the duplicates need to be removed
+#   xml_df <- xml_df[!duplicated(xml_df),]
+#   
+#   return(xml_df)
+# }
+# 
+# # apply the batch_pmid_retrieval function to all batches
+# batch_list <- lapply(1:nrow(batches), function(i) {
+#   pmids[batches[i, 1]:batches[i, 2], ]
+# })
+# 
+# # rbind all batches into one data frame
+# full_metadata_df <- do.call(rbind,lapply(batch_list, batch_pmid_retrieval))
+# 
+# # export as .rds file and as .txt file so that this only has to be run once as it is time consuming
+# saveRDS(full_metadata_df, file = "data/all_abstracts_2Feb26.rds")
+# write.table(full_metadata_df, file = "data/all_abstracts_2Feb26.txt", quote = FALSE, sep = "\t", row.names = FALSE)
+# 
+# # delete the temporary xml file
+# file.remove("data/tmp_ret.xml")
+```
+
+```{r begin-parsing-and-fetch abstracts}
+# read in saved abstract .rds file
+full_metadata_df <- readRDS(file = "data/all_abstracts_2Feb26.rds")
+
+#split the pub date into day, month, year columns
+full_metadata_df <- separate(full_metadata_df, grep("date", colnames(full_metadata_df)), into = c("day", "month", "year"), sep = "-", remove = FALSE)
+dim(full_metadata_df)
+
+#remove papers with no abstract
+full_noMiss_metadata_df <- full_metadata_df[!is.na(full_metadata_df$abstract),]
+dim(full_noMiss_metadata_df)
+
+#some titles import with brackets; remove those brackets
+full_noMiss_metadata_df$title <- gsub("^\\[", "", full_noMiss_metadata_df$title)
+full_noMiss_metadata_df$title <- gsub("\\]$", "", full_noMiss_metadata_df$title)
+
+#append PMID to abstract; the scientific name parser (gnfinder) prefers to be run only once on the entire dataset; by appending the PMID to the abstract text, we can then backtrace mentions of scientific names to the abstracts/PMIDs they belong to
+full_noMiss_metadata_df$abstract_wID <- paste("[[DOC:", 
+                                              full_noMiss_metadata_df$pmid, "]] ", 
+                                              full_noMiss_metadata_df$title, " ",
+                                              full_noMiss_metadata_df$abstract,
+                                              sep = "")
+#append abstracts together for gnfinder run
+abstracts_for_gnfinder <- paste(full_noMiss_metadata_df$abstract_wID, collapse = "\n")
+
+#occasionally authors will not include spaces when describing crosses and this interferes with gnfinder; forcibly adds spaces after and before hyphens
+abstracts_for_gnfinder <- gsub("-", " - ", abstracts_for_gnfinder)
+
+#create a table of start and end positions of each abstract using the appended PMIDs from above
+full_noMiss_metadata_df$start_pos <- gregexpr("\\[\\[DOC", abstracts_for_gnfinder)[[1]]
+full_noMiss_metadata_df$end_pos <- c((gregexpr("\\[\\[DOC", abstracts_for_gnfinder)[[1]][-1]-1), nchar(abstracts_for_gnfinder))
+
+# run gnfinder on all abstracts at once; using the arguments -s 11 and -f to use GBIF as the source database to verify matches against
+tsv <- system2(
+  "gnfinder",
+  args = c("-s","11","-U","-v","-f", "tsv"),
+  input = abstracts_for_gnfinder,
+  stdout = TRUE
+)
+
+# import gnfinder dataframe of detected scientific names
+abstract_df <- read.table(text = tsv, header = TRUE, sep = "\t", quote = "", stringsAsFactors = FALSE)
+
+#attach PMIDs to each entry
+setDT(abstract_df)
+setDT(full_noMiss_metadata_df)
+
+abstract_df <- abstract_df[full_noMiss_metadata_df,
+                           pmid := i.pmid,
+                           on = .(Start > start_pos, Start < end_pos)]
+
+
+#split identified scientific names into two categories; one is for good matches that don't need to be altered; the other is for potential scientific names where the genus is abbreviated
+abstract_df_good_matches <- abstract_df[!grepl("\\.", abstract_df$Name) & !abstract_df$VerifMatchType == "NoMatch",]
+abstract_df_abbreviated <- abstract_df[grepl("\\.", abstract_df$Name) & abstract_df$VerifMatchType == "NoMatch",]
+```
+
+```{r create-a-map-of-known-genera-for-abbreviated-taxa}
+# we want to replace abbreviated genus names with the non-abbreviated version where possible; for this, we need a map of the known possible genus names mentioned in each abstract
+global_genus_map <- data.frame()
+
+# #for each PMID in the dataframe of abbreviated genera; uncomment if you have never run this before
+# for (tmp_pmid in unique(abstract_df_abbreviated$pmid)) {
+#   
+#   #get known taxa for that PMID
+#   if(sum(abstract_df_good_matches$pmid == tmp_pmid) > 0){
+#     tmp_taxon_id <- unique(abstract_df_good_matches[abstract_df_good_matches$pmid == tmp_pmid,]$VerifTaxonId)
+#     
+#     genus_list <- c()
+#     
+#     #for each taxon in the list of known genera
+#     for(taxon_id in tmp_taxon_id) {
+#       
+#       #look up taxon in gbif
+#       tmp_gbif_data <- name_usage(key = taxon_id)$data
+#       
+#       # if that taxa has a genus name and is an animal taxon
+#       if(tmp_gbif_data$kingdom == "Animalia" & sum(grepl("genus", colnames(tmp_gbif_data))) > 0) {
+#         
+#         #here we are using the canonical genus instead of the best genus listed to increase chances of matching other entries in the abstract; append each genus name to the list of possibilities
+#         genus_list <- c(genus_list, gsub(" .*", "", tmp_gbif_data$canonicalName))
+#         
+#       }
+#     }
+#     
+#     #if there are any successful genera identified in the abstract already
+#     if(!is.null(genus_list)){
+#       
+#       #create a dataframe of candidate genera for each PMID along with the abbreviation is could stand for
+#       genus_map <- data.frame(Name = unique(genus_list), pmid = tmp_pmid)
+#       genus_map$shorthand <- substring(genus_map$Name, 0, 1)
+#       genus_map$shorthand <- gsub("$", ".", genus_map$shorthand)
+#       
+#       #concatenate all PMID-specific genus maps into one
+#       global_genus_map <- rbind(global_genus_map, genus_map)
+#     }
+#   }
+# }
+# 
+# #export the global genus map as a csv file so this only has to be run once
+# write.csv(file = "data/genus_map_2Feb26.csv", global_genus_map, quote = FALSE, row.names = FALSE)
+
+#read in the global genus map if it already exists
+global_genus_map <- read.csv("data/genus_map_2Feb26.csv")
+```
+
+```{r substitute-candidate-genera-for-abbreviations}
+# now that we have our list of candidate genera for each abstract, we need to fine tune the potential abbreviated species names; gnfinder search parameters meant that some common words were returned across potential scientific names; here we are removing those terms from the abbreviated names
+
+mistake_words <- c(" ale$" , " may$", "adna", "ancestor", "antennae", " ant$", "backcross", "based", "breed", "bulls", "cells", "chosen", "chromosomes", "chromosome", "circulate", "colonies", "compared", " cross$", "cultivars", "diagnosis", "donor", "evolution", " female$", " form$", "found", "further", " gene$", "habitat", "held", "hermaphrodites", "hermaphrodite", "indicated", "isolate", "juveniles", "lake", "larval", " line$", "loci", "low", "malaria", " male$", " mate", " mosaic$", " plus$", "pose", "progenies", "record", "sang", "seedlings", " sex$", "should", " size$", "skin", "smolts", "spermatozoa", "stable", "stock", "subpopulation", "subsp.", "superspecies", "there", "versus", "via", "-like", "�", " $")
+
+# replaces mistake words with nothing to clean the names for de-abbreviation below
+abstract_df_abbreviated$Name <- Reduce(
+  function(names, word) gsub(word, "", names),
+  mistake_words,
+  init = abstract_df_abbreviated$Name
+)
+
+#if genus was abbreviated with two letters instead of one, replace with just one letter
+abstract_df_abbreviated$Name <- gsub("^([A-Z])[a-z]\\.", "\\1.", abstract_df_abbreviated$Name)
+
+#beginning de-abbreviation; set new scientific names to pending that get overwritten as the de-abbreviation code progresses
+abstract_df_abbreviated$new_VerifTaxonId <- c("pending")
+abstract_df_abbreviated$new_Name <- c("pending")
+
+# pre-filter the genus map so that it only contains scientific names from abstracts that have abbreviated scientific names
+relevant_genera <- global_genus_map[global_genus_map$pmid %in% abstract_df_abbreviated$pmid, ]
+
+# split creates a list for each PMID and each entry contains the possible genera
+genera_by_pmid <- split(relevant_genera, relevant_genera$pmid)
+
+# beginning de-abbreviation; this code takes a long time to run; if you encounter an error with too many API requests, code can be continued on the row it left off at; uncomment if you have never run this before
+
+# for (row in 1:nrow(abstract_df_abbreviated)) {
+# # print loop status
+#   if(row%%100 == 0) {
+#     print(paste(row, "/", nrow(abstract_df_abbreviated), sep = ""))
+#     #Sys.sleep(10)
+#   }
+# 
+#   #retrieve the PMID for the row being operated on as well as the abbreviated name
+#   tmp_pmid <- abstract_df_abbreviated$pmid[row]
+#   current_name <- abstract_df_abbreviated$Name[row]
+# 
+#   #retrieve potential candidate genera for that PMID
+#   candidate_genera <- genera_by_pmid[[as.character(tmp_pmid)]]
+# 
+#   # if there are possible candidate genera
+#   if (!is.null(candidate_genera) && nrow(candidate_genera) > 0) {
+# 
+#     # narrow the list of candidate genera to those that have matching shorthands
+#     # (i.e. if the species is D. melanogaster, only keep genera that abbreviate to D.)
+#     matches <- sapply(candidate_genera$shorthand, function(shorthand) grepl(shorthand, current_name, fixed = TRUE))
+# 
+#     # if there are genera that have the matching abbreviation
+#     if (any(matches)) {
+#       matched_genera <- candidate_genera[matches, ]
+# 
+#       # create a list of candidate new species names with the matching genera replaced with the full length version
+#       candidate_species_list <- mapply(
+#         function(shorthand, name) gsub(shorthand, name, current_name, fixed = TRUE),
+#         matched_genera$shorthand,
+#         matched_genera$Name
+#       )
+# 
+#       # for all possible new candidate species names, check them against the rgbif taxonomy back bone
+#       #if you are hitting API limits, try altering bucket_size and sleep parameters
+#       candidate_species_df <- name_backbone_checklist(unique(candidate_species_list), bucket_size = 10)
+#       # add 1 second pause after API call to avoid hitting rate limits
+#       # Sys.sleep(1)
+# 
+#       # only keep high-confidence matches of the type "EXACT" or "VARIANT"
+#       exact_matches <- candidate_species_df$matchType == "EXACT" | candidate_species_df$matchType == "VARIANT"
+# 
+#       # for rows with one high-confidence match, add the new species name and taxon ID back to the original data frame
+#       if (sum(exact_matches) == 1) {
+#         abstract_df_abbreviated$new_VerifTaxonId[row] <- candidate_species_df$speciesKey[exact_matches]
+#         abstract_df_abbreviated$new_Name[row] <- candidate_species_df$species[exact_matches]
+#         next
+#       }
+#     }
+#   }
+# 
+#   # if either no or more than one high-confidence match was found, then indicate in original dataframe that de-abbreviation failed
+#   abstract_df_abbreviated$new_VerifTaxonId[row] <- "no_exact_match"
+#   abstract_df_abbreviated$new_Name[row] <- "no_exact_match"
+# }
+# 
+# saveRDS(abstract_df_abbreviated, file = "data/modified_abbreviated_names_2Feb26.rds")
+# write.csv(file = "data/modified_abbreviated_names_2Feb26.csv", abstract_df_abbreviated, quote = FALSE, row.names = FALSE)
+```
+
+```{r merge-full-names-with-abbreviated-names}
+# need to merge the originally successful scientific names with the new de-abbreviated names for each PMID
+abstract_df_abbreviated <- readRDS(file = "data/modified_abbreviated_names_2Feb26.rds")
+
+# restrict the abbreviated names to only those that were successfully de-abbreviated
+abstract_df_abbreviated_successful <- abstract_df_abbreviated[!abstract_df_abbreviated$new_VerifTaxonId == "no_exact_match" & !abstract_df_abbreviated$new_Name == "pending",]
+
+#combine with successfully de-abbreviated names with original good names that didn't need modification
+abstract_df_good_matches_sub <- abstract_df_good_matches[,c("Name", "VerifMatchedCanonical", "VerifTaxonId", "pmid")]
+abstract_df_abbreviated_successful_sub <- abstract_df_abbreviated_successful[,c("Name", "new_Name", "new_VerifTaxonId", "pmid")]
+colnames(abstract_df_good_matches_sub) <- c("original_name", "new_name", "taxon_id", "pmid")
+colnames(abstract_df_abbreviated_successful_sub) <- c("original_name", "new_name", "taxon_id", "pmid")
+
+all_matches_combined <- rbind(abstract_df_good_matches_sub, abstract_df_abbreviated_successful_sub)
+dim(all_matches_combined)
+
+#reduce duplicates
+all_matches_combined <- distinct(all_matches_combined[,c("new_name", "taxon_id", "pmid")])
+dim(all_matches_combined)
+
+# orignal good names identified with gnfinder do not always have matching taxonomic IDs to the de-abbreviated versions
+# re-add all name metadata from gbif so that the taxon_ids are comparable across the good matches and previously abbreviated sets
+# uncomment if you have never run this before
+
+# name_usage_list <- lapply(unique(all_matches_combined$taxon_id), name_usage)
+# 
+# name_usage_df <- name_usage_list %>%
+#   lapply(function(x) x$data) %>%
+#   bind_rows()
+# 
+# saveRDS(name_usage_df, file = "data/name_usage_df_2Feb26.rds")
+
+# read in previous run of name_usage_df
+name_usage_key_df <- readRDS(file = "data/name_usage_df_2Feb26.rds")
+
+name_usage_key_df$key <- as.character(name_usage_key_df$key)
+name_usage_key_df$speciesKey <- as.character(name_usage_key_df$speciesKey)
+
+#subset to relevant columns
+name_usage_key_df <- name_usage_key_df[,c("key",
+                                          "canonicalName",
+                                          "kingdomKey",
+                                          "phylumKey",
+                                          "classKey",
+                                          "orderKey",
+                                          "familyKey",
+                                          "genusKey",
+                                          "speciesKey",
+                                          "kingdom",
+                                          "phylum",
+                                          "class",
+                                          "order",
+                                          "family",
+                                          "genus",
+                                          "species")]
+
+# issue where Actinopterygii class is omitted - fixing manually
+actinopterygii <- c("Acanthuridae", "Acipenseridae", "Adrianichthyidae", "Albulidae", "Ammodytidae", "Anarhichadidae", "Anguillidae", "Anostomidae", "Atherinidae", "Atherinopsidae", "Bagridae", "Blenniidae", "Carangidae", "Catostomidae", "Centrarchidae", "Centropomidae", "Chaetodontidae", "Channichthyidae", "Channidae", "Characidae", "Cichlidae", "Clariidae", "Clupeidae", "Cobitidae", "Cottidae", "Cottocomephoridae", "Cyprinidae", "Cyprinodontidae", "Eleotridae", "Embiotocidae", "Engraulidae", "Erythrinidae", "Esocidae", "Fundulidae", "Gadidae", "Galaxiidae", "Gasterosteidae", "Gobiidae", "Gymnotidae", "Haemulidae", "Heteropneustidae", "Hexagrammidae", "Ictaluridae", "Labridae", "Leiognathidae", "Liparidae", "Macrouridae", "Mastacembelidae", "Melanotaeniidae", "Merlucciidae", "Mormyridae", "Moronidae", "Nothobranchiidae", "Osmeridae", "Osphronemidae", "Pangasiidae", "Paralichthyidae", "Percichthyidae", "Percidae", "Pimelodidae", "Pleuronectidae", "Poeciliidae", "Polynemidae", "Polyodontidae", "Pomacanthidae", "Pomacentridae", "Profundulidae", "Rivulidae", "Salmonidae", "Scaridae", "Sciaenidae", "Scombridae", "Scophthalmidae", "Scorpaenidae", "Sebastidae", "Serranidae", "Serrasalmidae", "Soleidae", "Sparidae", "Syngnathidae", "Telmatherinidae", "Tetraodontidae")
+name_usage_key_df[name_usage_key_df$family %in% actinopterygii,]$class <- "Actinopterygii"
+
+# create a "Genus species" column for use next with rGBIF
+name_usage_key_df_species <- name_usage_key_df[grep(" ", name_usage_key_df$canonicalName),]
+```
+
+```{r occurrence-lookup}
+# get counts of occurrences in different countries for each species
+get_occurrence_data <- function(taxon) {
+  # get GBIF species name corresponding to givne taxon
+  key <- name_usage_key_df_species[taxon,]$speciesKey
+  species <- name_usage_key_df_species[taxon,]$species
+  
+  # gather all country occurrence data with no GeospatialIssues for each taxon
+  tmp_counts <- occ_count(taxonKey=name_usage_key_df_species$speciesKey[taxon], 
+                          occurrenceStatus = "PRESENT", 
+                          hasGeospatialIssue = FALSE,
+                          facet = "country", facetLimit=250)
+  
+  # if there are any occurrence records
+  if(dim(tmp_counts)[1] > 0) {
+    
+    # make a dataframe for each taxon containing the species, the number of countries it was observed in (this is important for later to weed out widespread species), record the country with the most and second most occurrence records, as well as the number of records for each
+    df <- data.frame(key = key,
+                     species = species, 
+                     num_countries = dim(tmp_counts)[1],
+                     top_country = as.character(tmp_counts[1,1]),
+                     top_country_count = as.numeric(tmp_counts[1,2]),
+                     second_country = as.character(tmp_counts[2,1]),
+                     second_country_count = as.numeric(tmp_counts[2,2]))
+    
+  } else {
+    # if there are no occurrence records, set all the occurrence data to zero in the taxon-specific dataframe
+    df <- data.frame(key = key,
+                     species = species, 
+                     num_countries = 0,
+                     top_country = NA,
+                     top_country_count = 0,
+                     second_country = NA,
+                     second_country_count = 0)
+  }
+  return(df)
+}
+
+# #apply the get_occurrence_data function to all taxa with a good species name; this takes a while to run; uncomment if you have never run this before
+# occurrence_data_list <- lapply(1:nrow(name_usage_key_df_species), get_occurrence_data)
+# 
+# # rbind all occurrence data into one data frame and reduce duplicates
+# occurrence_data_df <- do.call(rbind, occurrence_data_list)
+# occurrence_data_df$key <- as.character(occurrence_data_df$key)
+# occurrence_data_df <- distinct(occurrence_data_df)
+# 
+# #save occurrence data
+# saveRDS(occurrence_data_df, file = "data/occurrence_data_df_2Feb26.rds")
+
+#read in occurrence data if the above chunk has been run before
+occurrence_data_df <- readRDS(file = "data/occurrence_data_df_2Feb26.rds")
+
+#now we need to eliminate widespread species; we do this in two ways
+#first we eliminate species where there is a negligible difference in occurrence records between the country with the most records and the country with the second most records
+occurrence_data_df$diff_in_top_occ <- (occurrence_data_df$top_country_count - occurrence_data_df$second_country_count)/
+  (occurrence_data_df$top_country_count + occurrence_data_df$second_country_count)
+occurrence_data_df[is.na(occurrence_data_df$diff_in_top_occ),]$diff_in_top_occ <- 0
+
+# quick plot to confirm that there is a correlation between the number of countries a species has occurrence data in and the relative difference in occurrence records between the top and second place country
+ggplot(occurrence_data_df, aes(x = num_countries, y = diff_in_top_occ)) +
+  geom_point() +
+  geom_smooth(method = "lm") 
+
+# the second method for filtering out widespread species; remove species that don't have a good country label assigned, that were observed in more than 50 countries, and where the difference between the top two countries was less than 25%
+occurrence_data_filtered_df <- occurrence_data_df[occurrence_data_df$top_country != "ZZ" &
+                                                    (occurrence_data_df$num_countries < 50 | 
+                                                       occurrence_data_df$diff_in_top_occ > 0.25),]
+
+# quick plot to confirm that the filtered species no longer contain these extremely widespread species
+ggplot(occurrence_data_filtered_df, aes(x = num_countries, y = diff_in_top_occ)) +
+  geom_point() +
+  geom_smooth(method = "lm") 
+```
+
+```{r pre-and-post-genomics-era-analysis}
+# Now that we have our species records for each PMID, we want to investigate how the genomics sequencing revolution has changed hybridization research
+# to begin, choose a year to split the data for pre/post-next gen sequencing comparisons
+trend_year <- 2015
+
+# add species metadata info + PMID to combined list of identified scientific names
+all_matches_with_metadata <- merge(all_matches_combined, name_usage_key_df, by.x = "taxon_id", by.y = "key")
+# also add publication metadata
+all_matches_with_metadata <- merge(all_matches_with_metadata, full_noMiss_metadata_df, by = "pmid")
+
+#remove non-animals
+all_matches_with_metadata <- all_matches_with_metadata[all_matches_with_metadata$kingdom == "Animalia",]
+dim(distinct(all_matches_with_metadata))
+
+# merge species metadata with occurrence data
+all_matches_combined_species_level <- all_matches_with_metadata[grep(" ", all_matches_with_metadata$new_name),]
+dim(distinct(all_matches_combined_species_level))
+
+all_matches_with_metadata_with_occurrence_data <- merge(all_matches_with_metadata, occurrence_data_filtered_df, by.x = "taxon_id", by.y = "key")
+dim(distinct(all_matches_with_metadata_with_occurrence_data))
+
+# create species level metadata
+all_matches_combined_species_level <- all_matches_with_metadata[!is.na(all_matches_with_metadata$species),]
+all_matches_combined_species_level <- all_matches_combined_species_level[,c("species", "pmid", "year")]
+all_matches_combined_species_level <- distinct(all_matches_combined_species_level)
+dim(distinct(all_matches_combined_species_level))
+
+#quick check of the top species before and after the genomics cut-off year; we can see that Drosophila, Mus, and Bos dominate these lists
+head(sort(table(all_matches_combined_species_level[all_matches_combined_species_level$year < trend_year,]$species), decreasing = TRUE), n = 10)
+head(sort(table(all_matches_combined_species_level[all_matches_combined_species_level$year > trend_year,]$species), decreasing = TRUE), n = 10)
+
+# create genus level metadata
+all_matches_combined_genus_level <- all_matches_with_metadata[!is.na(all_matches_with_metadata$genus),]
+all_matches_combined_genus_level <- all_matches_combined_genus_level[,c("genus", "pmid", "year")]
+all_matches_combined_genus_level <- distinct(all_matches_combined_genus_level)
+dim(distinct(all_matches_combined_genus_level))
+
+#quick check of the top genera before and after the genomics cut-off year; we can see that Drosophila melanogaster and simulans, Mus musculus, and Bos taurus dominate these lists
+head(sort(table(all_matches_combined_genus_level[all_matches_combined_genus_level$year < trend_year,]$genus), decreasing = TRUE), n = 10)
+head(sort(table(all_matches_combined_genus_level[all_matches_combined_genus_level$year > trend_year,]$genus), decreasing = TRUE), n = 10)
+
+# create family level metadata
+all_matches_combined_family_level <- all_matches_with_metadata[!is.na(all_matches_with_metadata$family),]
+all_matches_combined_family_level <- all_matches_combined_family_level[,c("family", "pmid", "year")]
+all_matches_combined_family_level <- distinct(all_matches_combined_family_level)
+dim(distinct(all_matches_combined_family_level))
+
+#quick check of the top genera before and after the genomics cut-off year; we can see that Drosophilidae and Muridae dominate before genomics, and that both drop in the post-genomics era
+head(sort(table(all_matches_combined_family_level[all_matches_combined_family_level$year < trend_year,]$family), decreasing = TRUE), n = 10)
+head(sort(table(all_matches_combined_family_level[all_matches_combined_family_level$year > trend_year,]$family), decreasing = TRUE), n = 10)
+
+# create order level metadata
+all_matches_combined_order_level <- all_matches_with_metadata[!is.na(all_matches_with_metadata$order),]
+all_matches_combined_order_level <- all_matches_combined_order_level[,c("order", "pmid", "year")]
+all_matches_combined_order_level <- distinct(all_matches_combined_order_level)
+dim(distinct(all_matches_combined_order_level))
+
+#quick check of the top orders pre- and post-genomics era
+head(sort(table(all_matches_combined_order_level[all_matches_combined_order_level$year < trend_year,]$order), decreasing = TRUE), n = 10)
+head(sort(table(all_matches_combined_order_level[all_matches_combined_order_level$year > trend_year,]$order), decreasing = TRUE), n = 10)
+
+# create class level metadata
+all_matches_combined_class_level <- all_matches_with_metadata[!is.na(all_matches_with_metadata$class),]
+all_matches_combined_class_level <- all_matches_combined_class_level[,c("class", "pmid", "year")]
+all_matches_combined_class_level <- distinct(all_matches_combined_class_level)
+dim(distinct(all_matches_combined_class_level))
+
+#quick check of the top orders pre- and post-genomics era; Insecta and Mammalia (driven by Mus and Drosophila) reign pre-genomics but then Actinopterygii and Aves make great strides post-genomics
+head(sort(table(all_matches_combined_class_level[all_matches_combined_class_level$year < trend_year,]$class), decreasing = TRUE), n = 10)
+head(sort(table(all_matches_combined_class_level[all_matches_combined_class_level$year > trend_year,]$class), decreasing = TRUE), n = 10)
+
+# create phylum level metadata
+all_matches_combined_phylum_level <- all_matches_with_metadata[!is.na(all_matches_with_metadata$phylum),]
+all_matches_combined_phylum_level <- all_matches_combined_phylum_level[,c("phylum", "pmid", "year")]
+all_matches_combined_phylum_level <- distinct(all_matches_combined_phylum_level)
+dim(distinct(all_matches_combined_phylum_level))
+
+#quick check of the top phyla pre- and post-genomics era; everything is Chordata or Arthropoda; minimal change with genomics
+head(sort(table(all_matches_combined_phylum_level[all_matches_combined_phylum_level$year < trend_year,]$phylum), decreasing = TRUE), n = 11)
+head(sort(table(all_matches_combined_phylum_level[all_matches_combined_phylum_level$year > trend_year,]$phylum), decreasing = TRUE), n = 11)
+```
+
+```{r map-occurrence-data}
+#import a world map sf object
+world_map <- ne_countries(scale = "medium", returnclass = "sf")
+
+#filter occurrence data frame to just the countries with the most occurrence records per species
+representation_df <- data.frame(table(all_matches_with_metadata_with_occurrence_data$top_country))
+
+#make sure country codes are consistent with world map and occurrence records
+colnames(representation_df) <- c("iso_a3", "country_count")
+representation_df$iso2c <- countrycode(representation_df$iso_a3, 
+                                       origin = "iso2c", 
+                                       destination = "iso3c")
+
+# merge data frames of world map countries and the occurrence records
+map_data_merged <- merge(world_map, representation_df, by.x = "wb_a2", by.y = "iso_a3",
+                         all = TRUE)
+
+#generate the species occurrence map in Figure 1E
+figure_1_species_map <- ggplot(data = map_data_merged) +
+  geom_sf(aes(fill = log(country_count)), color = "black", linewidth = 0.1) +
+  scale_fill_gradient(low = "#D1ECE6", high = "#2A5147", na.value = "#EDEDED") +
+  theme_minimal() +
+  labs(title = "Geographic distribution of hybridization studies", 
+       x = "Longitude", 
+       y = "Latitude",
+       fill = "log(Species count)") +
+  theme_void() +
+  coord_sf(crs = "ESRI:54030")
+
+figure_1_species_map
+```
+
+```{r hybridization-timeline}
+# generate the timeline of pubmed papers that mention hybridization with key papers of interest highlighted and split into the "Eras" of hybridization research discussed in the main text
+key_papers <- read.csv("data/key_hybridization_papers_and_eras.csv")
+eras <- key_papers[key_papers$category == "era",]
+eras[eras$label == "Classic Era",]$year <- 1945
+papers_only <- key_papers[key_papers$category == "paper",]
+papers_only <- papers_only[papers_only$year > 1945,]
+
+#formatting the data frame of all pubmed records
+full_metadata_df$year <- as.numeric(full_metadata_df$year)
+
+#plot histogram of hybridization papers over time for figure 1A
+figure_1_publication_histogram <- ggplot(full_metadata_df[!is.na(full_metadata_df$year),],
+                                         aes(x=year)) + 
+  geom_histogram(color="black", fill="#9b7b97", binwidth = 1, boundary = 0) +
+  geom_segment(data = papers_only, aes(x = year, y = 475, xend = year, yend = 425),
+               arrow = arrow(), position = position_jitter(width = 0.5)) +
+  geom_label_repel(data = papers_only, aes(x = year, y = 525, label = label),
+                   max.overlaps = 20) +
+  geom_rect(data = eras, aes(xmin = year + 1, xmax = end - 1, ymin = -5, ymax = -25),
+            fill = "lightgray") +
+  geom_text(data = eras, aes(x = (year + end)/2, y = -30, label = label)) +
+  ylim(-100, 600) +
+  xlim(1944, 2030) +
+  labs(x = "Publication date (year)",
+       y = "Number of papers published") +
+  theme_bw()
+```
+
+```{r phylum-pie-chart}
+# generate the pie chart of represented phyla in hybridization abstracts seen in Figure 1D
+phylum_counts <- data.frame(sort(table(all_matches_combined_phylum_level$phylum), decreasing = TRUE))
+colnames(phylum_counts) <- c("phylum", "count")
+
+# convert counts to coordinates for pie chart
+phylum_counts <- phylum_counts %>%
+  mutate(
+    csum = rev(cumsum(rev(count))),
+    pos = count/2 + lead(csum, 1),
+    pos = if_else(is.na(pos), count/2, pos)
+  )
+
+#generate the phylum pie chart
+figure_1_phylum_pie_chart <- ggplot(phylum_counts, aes(x="", y=count, fill=phylum)) +
+  geom_bar(stat="identity", width=1) +
+  coord_polar("y", start=0) +
+  scale_fill_manual(values = c("#5f2321",
+                               "#8b3838",
+                               "#a14041",
+                               "#ad6f70",
+                               "#ac8f8e",
+                               rep("#c2b6b7", 9))) +
+  geom_text_repel(
+    aes(y = pos, label = phylum),
+    x = 1.4,
+    max.overlaps = 24,
+    nudge_x = 0.5,
+    segment.size = 1,
+    segment.color = "black",
+    segment.linetype = "dotted", 
+    show.legend = FALSE
+  ) +
+  theme_void() +
+  theme(legend.position = "none")
+
+figure_1_phylum_pie_chart
+```
+
+```{r genus-df-generation}
+# this code generates figure 1B
+# calculate per-genus representation across abstracts before and after the "genomics" time split
+# begin by splitting genus dataframe by the pre- and post- genomics time split
+
+all_matches_combined_genus_level$year <- as.numeric(all_matches_combined_genus_level$year)
+pre_genomics_genus_merged_df <- all_matches_combined_genus_level[
+  as.numeric(all_matches_combined_genus_level$year) < trend_year &
+    !is.na(all_matches_combined_genus_level$year),]
+post_genomics_genus_merged_df <- all_matches_combined_genus_level[
+  as.numeric(all_matches_combined_genus_level$year) > trend_year &
+    !is.na(all_matches_combined_genus_level$year),]
+
+# calculate counts of each genus within each genomics era
+pre_genomics_genus <- data.frame(table(pre_genomics_genus_merged_df$genus))
+colnames(pre_genomics_genus) <- c("genus", "pre_count")
+post_genomics_genus <- data.frame(table(post_genomics_genus_merged_df$genus))
+colnames(post_genomics_genus) <- c("genus", "post_count")
+
+#merge pre- and post- genomics genus counts into one dataframe; set any genera not counted in one of the eras to zero
+both_time_genus <- merge(pre_genomics_genus, post_genomics_genus, by = "genus", all = TRUE)
+both_time_genus[is.na(both_time_genus$post_count),]$post_count <- 0
+both_time_genus[is.na(both_time_genus$pre_count),]$pre_count <- 0
+
+#convert genus counts to frequencies for each era
+both_time_genus$pre_total <- sum(both_time_genus$pre_count)
+both_time_genus$post_total <- sum(both_time_genus$post_count)
+both_time_genus$pre_freq <- both_time_genus$pre_count/
+  both_time_genus$pre_total
+both_time_genus$post_freq <- both_time_genus$post_count/
+  both_time_genus$post_total
+
+# get the top genera for each era
+both_time_genus_long <- pivot_longer(both_time_genus[,c(1,6,7)], col = c(2,3))
+colnames(both_time_genus_long) <- c("genus", "time", "count")
+both_time_genus_long$time <- factor(both_time_genus_long$time,
+                                    c("pre_freq", "post_freq"))
+top_genera_pre <- head(pre_genomics_genus[order(-pre_genomics_genus$pre_count), ], 10)$genus
+top_genera_post <- head(post_genomics_genus[order(-post_genomics_genus$post_count), ], 10)$genus
+
+# reformat to long format for plotting with ggplot
+both_time_genus_long_top10 <- both_time_genus_long[order(-both_time_genus_long$count), ]
+both_time_genus_long_top10 <- both_time_genus_long_top10[both_time_genus_long_top10$genus %in% unique(c(top_genera_pre, top_genera_post)),]
+```
+
+```{r genus-plot-generation}
+#these are the phylopic silhouettes selected for the genus graph; all have public domain or CC1.0 licenses
+Mus <- "92989e35-4e68-4a2d-b3a2-191ba9da671a"
+Anopheles <- "f538aa99-5c08-4f96-97d9-2e094ef5d84f"
+Bos <- "8a2d5863-cd6c-4158-a164-d62e789c2210"
+Caenorhabditis <- "ec9e9684-3730-48a0-b0e5-d1c30d6c842c"
+Canis <- "d451e353-585a-4543-84e7-7ef2f90aa407"
+Carassius <- "de187ba5-0498-4d2e-a688-70245c354c5f"
+Drosophila <- "c5564abf-a920-4ee3-a6a1-02c4eca1a671"
+Heliconius <- "ee7eb3c6-540f-4543-a9ab-1a09dc30ca8b"
+Pelophylax <- "4d1f2d5f-9683-4f35-8e46-d31d6004be51"
+Salmo <- "23a7d09d-4a4d-4ad5-ad07-49a6b59a7fba"
+Schistosoma <- "ef7c2cbf-d8dd-440c-9825-77863f93f35e"
+Xenopus <- "ece07f70-61bc-47e2-afb3-3aa6965f414f"
+Xiphophorus <- "3cd4fdfe-213f-4dd3-8e87-9051f491d555"
+
+# set the plotting order to be in the order of frequency during the pre-genomics era
+pre_order <- setorder(both_time_genus_long_top10[both_time_genus_long_top10$time == "pre_freq",], -count)
+
+#factor genera for plotting
+both_time_genus_long_top10$genus <- factor(both_time_genus_long_top10$genus,
+                                           levels = pre_order$genus)
+
+#generate figure 1B
+genus_barplot <- ggplot(data = both_time_genus_long_top10, 
+                        aes(x = genus, y = count, group = time, fill = time)) +
+  geom_bar(position="dodge", stat="identity") + 
+  add_phylopic(uuid = Drosophila, x = which(pre_order$genus %in% "Drosophila"), 
+               y = 0.18, 
+               alpha = 1, width = 0.6) + 
+  add_phylopic(uuid = Mus, x = which(pre_order$genus %in% "Mus"), 
+               y = 0.18, 
+               alpha = 1, width = 0.6) + 
+  add_phylopic(uuid = Anopheles, x = which(pre_order$genus %in% "Anopheles"), 
+               y = 0.18, 
+               alpha = 1, width = 0.6) + 
+  add_phylopic(uuid = Bos, x = which(pre_order$genus %in% "Bos"), 
+               y = 0.18, 
+               alpha = 1, width = 0.6) + 
+  add_phylopic(uuid = Xiphophorus, x = which(pre_order$genus %in% "Xiphophorus"), 
+               y = 0.18, 
+               alpha = 1, width = 0.6) + 
+  add_phylopic(uuid = Pelophylax, x = which(pre_order$genus %in% "Pelophylax"), 
+               y = 0.18, 
+               alpha = 1, width = 0.6) + 
+  add_phylopic(uuid = Schistosoma, x = which(pre_order$genus %in% "Schistosoma"), 
+               y = 0.18, 
+               alpha = 1, width = 0.6, angle = 90) + 
+  add_phylopic(uuid = Xenopus, x = which(pre_order$genus %in% "Xenopus"), 
+               y = 0.18, 
+               alpha = 1, width = 0.6) + 
+  add_phylopic(uuid = Carassius, x = which(pre_order$genus %in% "Carassius"), 
+               y = 0.18, 
+               alpha = 1, width = 0.6) + 
+  add_phylopic(uuid = Canis, x = which(pre_order$genus %in% "Canis"), 
+               y = 0.18, 
+               alpha = 1, width = 0.6) + 
+  add_phylopic(uuid = Heliconius, x = which(pre_order$genus %in% "Heliconius"), 
+               y = 0.18, 
+               alpha = 1, width = 0.6) + 
+  add_phylopic(uuid = Salmo, x = which(pre_order$genus %in% "Salmo"), 
+               y = 0.18, 
+               alpha = 1, width = 0.6) + 
+  add_phylopic(uuid = Caenorhabditis, x = which(pre_order$genus %in% "Caenorhabditis"), 
+               y = 0.18, 
+               alpha = 1, width = 0.6) + 
+  ylab("Genus frequency") +
+  ylim(0, 0.22) + 
+  scale_fill_manual(values = c("#607b9a", "#a4b8ce")) +
+  theme_bw() +
+  theme(axis.title.x = element_blank(),
+        legend.position = "none")
+
+genus_barplot
+
+#save genus barplot
+ggsave(filename = "figures/genus_barplot.pdf", genus_barplot, w = 15, h = 5)
+```
+
+```{r class-df-generation}
+# this code generate figure 1B
+# calculate per-class representation across abstracts before and after the "genomics" time split
+# begin by splitting class dataframe by the pre- and post- genomics time split
+all_matches_combined_class_level$year <- as.numeric(all_matches_combined_class_level$year)
+pre_genomics_class_merged_df <- all_matches_combined_class_level[
+  as.numeric(all_matches_combined_class_level$year) < trend_year &
+    !is.na(all_matches_combined_class_level$year),]
+post_genomics_class_merged_df <- all_matches_combined_class_level[
+  as.numeric(all_matches_combined_class_level$year) > trend_year &
+    !is.na(all_matches_combined_class_level$year),]
+
+# calculate counts of each class within each genomics era
+pre_genomics_class <- data.frame(table(pre_genomics_class_merged_df$class))
+colnames(pre_genomics_class) <- c("class", "pre_count")
+post_genomics_class <- data.frame(table(post_genomics_class_merged_df$class))
+colnames(post_genomics_class) <- c("class", "post_count")
+
+#merge pre- and post- genomics class counts into one dataframe; set any classes not counted in one of the eras to zero
+both_time_class <- merge(pre_genomics_class, post_genomics_class, by = "class", all = TRUE)
+both_time_class[is.na(both_time_class$post_count),]$post_count <- 0
+both_time_class[is.na(both_time_class$pre_count),]$pre_count <- 0
+
+#convert class counts to frequencies for each era
+both_time_class$pre_total <- sum(both_time_class$pre_count)
+both_time_class$post_total <- sum(both_time_class$post_count)
+both_time_class$pre_freq <- both_time_class$pre_count/
+  both_time_class$pre_total
+both_time_class$post_freq <- both_time_class$post_count/
+  both_time_class$post_total
+
+# get the top classes for each era
+both_time_class_long <- pivot_longer(both_time_class[,c(1,6,7)], col = c(2,3))
+colnames(both_time_class_long) <- c("class", "time", "count")
+both_time_class_long$time <- factor(both_time_class_long$time,
+                                    c("pre_freq", "post_freq"))
+top_genera_pre <- head(pre_genomics_class[order(-pre_genomics_class$pre_count), ], 10)$class
+top_genera_post <- head(post_genomics_class[order(-post_genomics_class$post_count), ], 10)$class
+
+# reformat to long format for plotting with ggplot
+both_time_class_long_top10 <- both_time_class_long[order(-both_time_class_long$count), ]
+both_time_class_long_top10 <- both_time_class_long_top10[both_time_class_long_top10$class %in% unique(c(top_genera_pre, top_genera_post)),]
+```
+
+```{r class-plot-generation}
+#these are the phylopic silhouettes selected for the class graph; all have public domain or CC1.0 licenses
+Insecta <- Drosophila
+Mammalia <- Mus
+Actinopterygii <- Xiphophorus
+Aves <- "2397404d-2233-41ba-a0ff-9fcb456ced5d"
+Amphibia <- Pelophylax
+Gastropoda <- "3244258c-e93a-497b-8f37-ac008e574c44"
+Arachnida <- "27e86f16-d3d8-4e6a-9fb6-13014f5153de"  
+Trematoda <- Schistosoma
+Chromadorea <- Caenorhabditis
+Squamata <- "0f1f41e3-8f10-489f-9cbb-7ce8f8a6653e"
+
+# set the plotting order to be in the order of frequency during the pre-genomics era
+pre_order <- setorder(both_time_class_long_top10[both_time_class_long_top10$time == "pre_freq",], -count)
+
+#factor genera for plotting
+both_time_class_long_top10$class <- factor(both_time_class_long_top10$class,
+                                           levels = pre_order$class)
+
+#generate figure 1C
+class_barplot <- ggplot(data = both_time_class_long_top10, 
+                        aes(x = class, y = count, group = time, fill = time)) +
+  geom_bar(position="dodge", stat="identity") + 
+  add_phylopic(uuid = Insecta, x = which(pre_order$class %in% "Insecta"), 
+               y = 0.44, 
+               alpha = 1, width = 0.5) + 
+  add_phylopic(uuid = Mammalia, x = which(pre_order$class %in% "Mammalia"), 
+               y = 0.44, 
+               alpha = 1, width = 0.5) + 
+  add_phylopic(uuid = Actinopterygii, x = which(pre_order$class %in% "Actinopterygii"), 
+               y = 0.44, 
+               alpha = 1, width = 0.5) + 
+  add_phylopic(uuid = Aves, x = which(pre_order$class %in% "Aves"), 
+               y = 0.44, 
+               alpha = 1, width = 0.5) + 
+  add_phylopic(uuid = Amphibia, x = which(pre_order$class %in% "Amphibia"), 
+               y = 0.44, 
+               alpha = 1, width = 0.5) + 
+  add_phylopic(uuid = Gastropoda, x = which(pre_order$class %in% "Gastropoda"), 
+               y = 0.44, 
+               alpha = 1, width = 0.5) + 
+  add_phylopic(uuid = Arachnida, x = which(pre_order$class %in% "Arachnida"), 
+               y = 0.44, 
+               alpha = 1, width = 0.5, angle = 90) + 
+  add_phylopic(uuid = Trematoda, x = which(pre_order$class %in% "Trematoda"), 
+               y = 0.44, 
+               alpha = 1, width = 0.5, angle = 90) + 
+  add_phylopic(uuid = Chromadorea, x = which(pre_order$class %in% "Chromadorea"), 
+               y = 0.44, 
+               alpha = 1, width = 0.5) + 
+  add_phylopic(uuid = Squamata, x = which(pre_order$class %in% "Squamata"), 
+               y = 0.44, 
+               alpha = 1, width = 0.5) + 
+  ylab("Class frequency") +
+  ylim(0, 0.5) + 
+  scale_fill_manual(values = c("#607b9a", "#a4b8ce")) +
+  theme_bw() +
+  theme(axis.title.x = element_blank(),
+        legend.position = "none")
+
+class_barplot
+
+#save the class bar plot
+ggsave(filename = "figures/class_barplot.pdf", class_barplot, w = 15, h = 5)
+```
+
+```{r assemble-full-figure-1}
+figure_1 <- plot_grid(figure_1_species_map, figure_1_publication_histogram, 
+                              plot_grid(plot_grid(genus_barplot, class_barplot, nrow = 2, align = "v"),
+                                        figure_1_phylum_pie_chart, nrow = 1,
+                                        align = "h", rel_widths = c(2,1)), 
+                              nrow = 3, rel_heights = c(2,1,1.5))
+
+figure_1
+
+ggsave(filename = "figures/Figure_1.pdf", figure_1, w = 14, h = 14)
+ggsave(filename = "figures/Figure_1.png", figure_1, w = 14, h = 14)
+```

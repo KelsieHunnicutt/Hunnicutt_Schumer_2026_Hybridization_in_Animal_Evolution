@@ -1,0 +1,109 @@
+---
+title: "plot_neanderthal_ancestry_deserts"
+output: html_document
+date: "2026-05-06"
+---
+
+```{r setup}
+library(ggplot2) 
+library(GenomicRanges)
+library(cowplot)
+
+#set working directory
+knitr::opts_knit$set(root.dir = "~/Hybridization_in_animal_evolution_review")
+getwd()
+
+#unlink any previous RData files that may be slowing down your R script
+unlink(".RData")
+options(scipen = 999)
+```
+
+```{r import-neanderthal-tracts-and-hg19-info}
+#this code generates Figure 2B from Hunnicutt and Schumer 2026; it is intended for illustrative purposes of the concept of Minor Parent Ancestry Deserts only; not an actual analysis of archiac human ancestry in modern humans; this code uses data original publish in Chen 2020
+# the original article can be found here: https://www.cell.com/cell/fulltext/s0092-8674(20)30059-3
+
+# chromosome lengths of hg19 were taken from this NCBI assembly: GCF_000001405.13
+hg19_info <- read.csv("data/hg19_chromosome_lengths.csv", header = FALSE)
+colnames(hg19_info) <- c("chr", "end")
+hg19_info$start <- 1
+hg19_info$y_position <- seq(1, 24)
+
+# the supplement the neanderthal ancestry tracts were was pulled from is here: https://drive.google.com/drive/folders/1mDQaDFS-j22Eim5_y7LAsTTNt5GWsoow
+#this file is actually not included because of GitHub file size restrictions; you must download it yourself
+neanderthal_tracts <- read.table("data/Chen_2020_Neanderthal sequence in 1000 genome.50kb.txt", header = TRUE)
+
+#restrict to only neanderthal tracts that were deemed significant
+sig_neanderthal_tracts <- neanderthal_tracts[neanderthal_tracts$LOD > 3,]
+
+#randomly sample three modern day humans for visualization
+one_neanderthal_tracts <- sig_neanderthal_tracts[sig_neanderthal_tracts$ID == "HG04189",]
+one_neanderthal_tracts <- merge(one_neanderthal_tracts, hg19_info[,c(1,4)], by = "chr")
+two_neanderthal_tracts <- sig_neanderthal_tracts[sig_neanderthal_tracts$ID == "HG01519",]
+two_neanderthal_tracts <- merge(two_neanderthal_tracts, hg19_info[,c(1,4)], by = "chr")
+three_neanderthal_tracts <- sig_neanderthal_tracts[sig_neanderthal_tracts$ID == "HG01312",]
+three_neanderthal_tracts <- merge(three_neanderthal_tracts, hg19_info[,c(1,4)], by = "chr")
+
+# import the reported ancestry deserts from Chen 2020
+chen_deserts <- read.csv("data/Chen_2020_Neanderthal_Ancestry_Deserts.csv")
+chen_deserts$chr <- chen_deserts$y_position
+
+#convert to a genomicRangs object for visualization
+neanderthal_tracts_GRanges <- GRanges(
+  seqnames = neanderthal_tracts$chr,
+  ranges = IRanges(start = neanderthal_tracts$start, end = neanderthal_tracts$end)
+)
+print(neanderthal_tracts_GRanges)
+```
+
+```{r plot-ancestry-tracts}
+# randomly chose a chromosome with a known desert on it for the purposes of the illustrative example
+which_chr <- 3
+
+#generate a plot of neanderthal ancestry tracts for the first randomly selected modern individual
+neanderthal_tracts_one_plot <- ggplot(hg19_info[hg19_info$chr == which_chr,], 
+                                      aes(xmin = start, xmax = end, 
+                                          ymin = y_position - 0.4, ymax = y_position + 0.4)) +
+  geom_rect(fill = "white", color = "black") +
+  geom_rect(data = one_neanderthal_tracts[one_neanderthal_tracts$chr == which_chr,], color = "#6ea1d1") +
+  geom_text(aes(x = -10000000, y = y_position, label = chr)) +
+  theme_void()
+
+#generate a plot of neanderthal ancestry tracts for the second randomly selected modern individual
+neanderthal_tracts_two_plot <- ggplot(hg19_info[hg19_info$chr == which_chr,], 
+                                      aes(xmin = start, xmax = end, 
+                                          ymin = y_position - 0.4, ymax = y_position + 0.4)) +
+  geom_rect(fill = "white", color = "black") +
+  geom_rect(data = two_neanderthal_tracts[two_neanderthal_tracts$chr == which_chr,], color = "#6ea1d1") +
+  geom_text(aes(x = -10000000, y = y_position, label = chr)) +
+  theme_void()
+
+#generate a plot of neanderthal ancestry tracts for the third randomly selected modern individual
+neanderthal_tracts_three_plot <- ggplot(hg19_info[hg19_info$chr == which_chr,], 
+                                        aes(xmin = start, xmax = end, 
+                                            ymin = y_position - 0.4, ymax = y_position + 0.4)) +
+  geom_rect(fill = "white", color = "black") +
+  geom_rect(data = three_neanderthal_tracts[three_neanderthal_tracts$chr == which_chr,], color = "#6ea1d1") +
+  geom_text(aes(x = -10000000, y = y_position, label = chr)) +
+  theme_void()
+
+#generate a plot of the reported neanderthal ancestry desert on chromosome 3
+neanderthal_desert_plot <- ggplot(hg19_info[hg19_info$chr == which_chr,], 
+                                  aes(xmin = start, xmax = end, 
+                                      ymin = y_position - 0.4, ymax = y_position + 0.4)) +
+  geom_rect(fill = "white", color = "black") +
+  geom_rect(data = chen_deserts[chen_deserts$chr == which_chr,], color = "black") +
+  geom_text(aes(x = -10000000, y = y_position, label = chr)) +
+  theme_void()
+
+# combine all four plots to produce figure 2B
+chr_3_desert_plot <- plot_grid(neanderthal_tracts_one_plot, neanderthal_tracts_two_plot, neanderthal_tracts_three_plot,
+          neanderthal_desert_plot, nrow =4)
+
+chr_3_desert_plot
+
+#save figure
+ggsave(filename = "figures/Figure_2B_neanderthal_desert.pdf", chr_3_desert_plot)
+```
+
+
+
